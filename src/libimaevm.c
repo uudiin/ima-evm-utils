@@ -891,6 +891,7 @@ static int sign_hash_v2(const char *algo, const unsigned char *hash,
 	EVP_PKEY *pkey;
 	char name[20];
 	EVP_PKEY_CTX *ctx = NULL;
+	EVP_MD_CTX *mctx = NULL;
 	const EVP_MD *md;
 	size_t sigsize;
 	const char *st;
@@ -932,24 +933,47 @@ static int sign_hash_v2(const char *algo, const unsigned char *hash,
 		return -1;
 	}
 
+#if OPENSSL_VERSION_NUMBER < 0x30000000
+	/*
+	 * SM2 and SM3 should go together. If SM3 hash algorithm and EC private
+	 * key are used at the same time, check whether it is SM2 private key.
+	 */
+	if (hdr->hash_algo == PKEY_HASH_SM3_256 && EVP_PKEY_id(pkey) == EVP_PKEY_EC) {
+		EC_KEY *ec = EVP_PKEY_get0_EC_KEY(pkey);
+		int curve = EC_GROUP_get_curve_name(EC_KEY_get0_group(ec));
+		if (curve == NID_sm2)
+			EVP_PKEY_set_alias_type(pkey, EVP_PKEY_SM2);
+	}
+#endif
+
 	calc_keyid_v2(&keyid, name, pkey);
 	hdr->keyid = keyid;
 
 	st = "EVP_PKEY_CTX_new";
 	if (!(ctx = EVP_PKEY_CTX_new(pkey, NULL)))
 		goto err;
-	st = "EVP_PKEY_sign_init";
-	if (!EVP_PKEY_sign_init(ctx))
+	st = "EVP_MD_CTX_new";
+	if (!(mctx = EVP_MD_CTX_new()))
 		goto err;
+	if (EVP_PKEY_id(pkey) == EVP_PKEY_SM2) {
+		st = "EVP_PKEY_CTX_set1_id";
+		/* Set SM2 default userid */
+		if (!EVP_PKEY_CTX_set1_id(ctx, "1234567812345678", 16))
+			goto err;
+	}
+	EVP_MD_CTX_set_pkey_ctx(mctx, ctx);
 	st = "EVP_get_digestbyname";
 	if (!(md = EVP_get_digestbyname(imaevm_params.hash_algo)))
 		goto err;
-	st = "EVP_PKEY_CTX_set_signature_md";
-	if (!EVP_PKEY_CTX_set_signature_md(ctx, md))
+	st = "EVP_DigestSignInit";
+	if (!EVP_DigestSignInit(mctx, NULL, md, NULL, pkey))
 		goto err;
-	st = "EVP_PKEY_sign";
+	st = "EVP_DigestSignUpdate";
+	if (!EVP_DigestSignUpdate(mctx, hash, size))
+		goto err;
+	st = "EVP_DigestSignFinal";
 	sigsize = MAX_SIGNATURE_SIZE - sizeof(struct signature_v2_hdr) - 1;
-	if (!EVP_PKEY_sign(ctx, hdr->sig, &sigsize, hash, size))
+	if (!EVP_DigestSignFinal(mctx, hdr->sig, &sigsize))
 		goto err;
 	len = (int)sigsize;
 
@@ -964,6 +988,7 @@ err:
 			ERR_reason_error_string(ERR_peek_error()), st);
 		output_openssl_errors();
 	}
+	EVP_MD_CTX_free(mctx);
 	EVP_PKEY_CTX_free(ctx);
 	EVP_PKEY_free(pkey);
 	return len;
